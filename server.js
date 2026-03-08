@@ -1,154 +1,168 @@
-import express from "express";
-import multer from "multer";
-import fs from "fs";
-import sharp from "sharp";
-import { execSync } from "child_process";
-import { PDFDocument } from "pdf-lib";
+import express from "express"
+import multer from "multer"
+import fs from "fs"
+import sharp from "sharp"
+import { execSync } from "child_process"
+import { PDFDocument } from "pdf-lib"
 
-const app = express();
-const upload = multer({ dest: "uploads/" });
+const app = express()
+const upload = multer({ dest:"uploads/" })
 
 function sizeKB(path){
-  return fs.statSync(path).size / 1024;
+ return fs.statSync(path).size / 1024
 }
 
 function cleanTemp(){
-  if(!fs.existsSync("temp_images")) fs.mkdirSync("temp_images");
-  fs.readdirSync("temp_images").forEach(f=>{
-    fs.unlinkSync(`temp_images/${f}`);
-  });
+
+ if(!fs.existsSync("temp_images")) fs.mkdirSync("temp_images")
+
+ fs.readdirSync("temp_images").forEach(f=>{
+  fs.unlinkSync(`temp_images/${f}`)
+ })
+
 }
 
-// -------- Ghostscript --------
+// -------- Ghostscript Compression --------
+
 function ghostCompress(input,output){
 
  execSync(`gs -sDEVICE=pdfwrite \
  -dCompatibilityLevel=1.4 \
  -dPDFSETTINGS=/screen \
  -dNOPAUSE -dQUIET -dBATCH \
- -sOutputFile=${output} ${input}`);
+ -sOutputFile=${output} ${input}`)
 
 }
 
-// -------- Extreme Adaptive --------
+// -------- Extreme Binary Search Compression --------
+
 async function extremeCompress(input,target){
 
- cleanTemp();
+ cleanTemp()
 
- execSync(`pdftoppm -jpeg -r 72 ${input} temp_images/page`);
+ execSync(`pdftoppm -jpeg -r 72 ${input} temp_images/page`)
 
  const files = fs.readdirSync("temp_images")
-  .filter(f => f.endsWith(".jpg") || f.endsWith(".jpeg"))
-  .sort();
+   .filter(f=>f.endsWith(".jpg") || f.endsWith(".jpeg"))
+   .sort()
 
  if(files.length === 0){
-   throw new Error("Image extraction failed");
+  throw new Error("Image extraction failed")
  }
 
- const qualities = [70,60,50,40,35,30,25,20];
+ let minQ = 10
+ let maxQ = 90
 
- let bestFile = null;
- let bestDiff = Infinity;
+ let bestFile = null
+ let bestDiff = Infinity
 
- for(const q of qualities){
+ for(let i=0;i<8;i++){
 
-   const pdf = await PDFDocument.create();
+  const q = Math.floor((minQ + maxQ)/2)
 
-   for(const f of files){
+  const pdf = await PDFDocument.create()
 
-     const imgPath = `temp_images/${f}`;
+  for(const f of files){
 
-     const imgBuffer = fs.readFileSync(imgPath);
+   const imgBuffer = fs.readFileSync(`temp_images/${f}`)
 
-     const compressed = await sharp(imgBuffer)
-       .resize({ width: 900 })
-       .jpeg({ quality: q })
-       .toBuffer();
+   const compressed = await sharp(imgBuffer)
+     .resize({ width:900 })
+     .jpeg({ quality:q })
+     .toBuffer()
 
-     const img = await pdf.embedJpg(compressed);
+   const img = await pdf.embedJpg(compressed)
 
-     const page = pdf.addPage([img.width, img.height]);
+   const page = pdf.addPage([img.width,img.height])
 
-     page.drawImage(img,{
-       x:0,
-       y:0,
-       width:img.width,
-       height:img.height
-     });
+   page.drawImage(img,{
+    x:0,
+    y:0,
+    width:img.width,
+    height:img.height
+   })
 
-   }
+  }
 
-   const pdfBytes = await pdf.save();
+  const bytes = await pdf.save()
 
-   const out = `outputs/out-${Date.now()}-${q}.pdf`;
+  const out = `outputs/out-${Date.now()}-${q}.pdf`
 
-   fs.writeFileSync(out,pdfBytes);
+  fs.writeFileSync(out,bytes)
 
-   const size = sizeKB(out);
+  const size = sizeKB(out)
 
-   if(size < 5){
-     continue; // corrupted ignore
-   }
+  if(size < 5) continue
 
-   const diff = Math.abs(size-target);
+  const diff = Math.abs(size-target)
 
-   if(diff < bestDiff){
-     bestDiff = diff;
-     bestFile = out;
-   }
+  if(diff < bestDiff){
+   bestDiff = diff
+   bestFile = out
+  }
 
-   if(size <= target){
-     return out;
-   }
+  if(size > target){
+   maxQ = q - 1
+  }else{
+   minQ = q + 1
+  }
 
  }
 
- return bestFile;
+ return bestFile
+
 }
 
 // -------- API --------
+
 app.post("/compress",upload.single("file"),async(req,res)=>{
 
  try{
 
-   const input = req.file.path;
-   const target = parseInt(req.body.target);
+  const input = req.file.path
 
-   const original = sizeKB(input);
+  const target = parseInt(req.body.target)
 
-   let output;
+  if(!target) return res.status(400).send("Target size required")
 
-   if(original / target > 2){
+  const original = sizeKB(input)
 
-     output = await extremeCompress(input,target);
+  let output
 
-   }else{
+  if(original / target > 2){
 
-     output = `outputs/out-${Date.now()}.pdf`;
+   output = await extremeCompress(input,target)
 
-     ghostCompress(input,output);
+  }else{
 
-   }
+   output = `outputs/out-${Date.now()}.pdf`
 
-   if(!fs.existsSync(output)){
-     return res.status(500).send("Compression failed");
-   }
+   ghostCompress(input,output)
 
-   res.download(output);
+  }
+
+  if(!output || !fs.existsSync(output)){
+   return res.status(500).send("Compression failed")
+  }
+
+  res.download(output)
 
  }catch(e){
 
-   console.error(e);
-   res.status(500).send("Compression error");
+  console.error(e)
+
+  res.status(500).send("Compression error")
 
  }
 
-});
+})
+
+// -------- Status --------
 
 app.get("/",(req,res)=>{
- res.send("Smart PDF Compressor running");
-});
+ res.send("Smart PDF Compressor running")
+})
 
 app.listen(3000,()=>{
- console.log("Server running");
-});
+ console.log("Server running")
+})

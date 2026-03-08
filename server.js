@@ -10,88 +10,69 @@ import crypto from "crypto";
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-// Folders Setup
-["uploads", "outputs", "temp_images"].forEach(dir => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-});
+["uploads", "outputs", "temp_images"].forEach(d => !fs.existsSync(d) && fs.mkdirSync(d));
 
-async function smartCompress(inputPath, targetKB) {
+const sizeKB = (p) => fs.statSync(p).size / 1024;
+
+// -------- Ghostscript Strategy --------
+function tryGhost(input, target, profile) {
+    const out = `outputs/gs_${profile}_${Date.now()}.pdf`;
+    try {
+        execSync(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/${profile} -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${out} "${input}"`);
+        const s = sizeKB(out);
+        // Agar size target ke 10% range mein hai, toh ye best hai
+        if (s <= target && s >= target * 0.85) return { path: out, size: s, success: true };
+        return { path: out, size: s, success: false };
+    } catch (e) {
+        return { success: false };
+    }
+}
+
+// -------- Sharp Extreme Strategy --------
+async function extremeCompress(inputPath, targetKB) {
     const sessionID = crypto.randomUUID();
     const sessionDir = path.join("temp_images", sessionID);
     fs.mkdirSync(sessionDir);
 
     try {
-        // Step 1: Dynamic DPI selection based on target
-        // Agar target bada hai toh high quality images extract karo
-        const extractDPI = targetKB > 150 ? 300 : 150;
-        execSync(`pdftoppm -jpeg -r ${extractDPI} "${inputPath}" "${sessionDir}/page"`);
-        
-        const files = fs.readdirSync(sessionDir)
-            .filter(f => f.endsWith(".jpg"))
-            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+        const dpi = targetKB > 150 ? 300 : 150;
+        execSync(`pdftoppm -jpeg -r ${dpi} "${inputPath}" "${sessionDir}/page"`);
+        const files = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jpg")).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
 
-        let minQ = 5;
-        let maxQ = 100;
-        let currentWidth = targetKB > 150 ? 1800 : 1100; // Starting width based on target
+        let minQ = 5, maxQ = 100, currentWidth = targetKB > 150 ? 1600 : 1000;
         let bestBytes = null;
-        let bestDiff = Infinity;
 
-        // Loop for 10 iterations to find the exact sweet spot
         for (let i = 0; i < 10; i++) {
             const q = Math.floor((minQ + maxQ) / 2);
             const pdf = await PDFDocument.create();
-
-            // Parallel Image Processing for Speed
-            const pageBuffers = await Promise.all(files.map(async (f) => {
-                const imgBuffer = fs.readFileSync(path.join(sessionDir, f));
-                return await sharp(imgBuffer)
+            const pageBuffers = await Promise.all(files.map(async f => {
+                return await sharp(path.join(sessionDir, f))
                     .resize({ width: Math.floor(currentWidth) })
-                    .jpeg({ quality: q, mozjpeg: true })
-                    .toBuffer();
+                    .jpeg({ quality: q, mozjpeg: true }).toBuffer();
             }));
 
-            for (const imgBuf of pageBuffers) {
-                const img = await pdf.embedJpg(imgBuf);
-                const page = pdf.addPage([img.width, img.height]);
-                page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+            for (const b of pageBuffers) {
+                const img = await pdf.embedJpg(b);
+                pdf.addPage([img.width, img.height]).drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
             }
 
-            const pdfBytes = await pdf.save();
-            const currentSize = pdfBytes.length / 1024;
-            const diff = Math.abs(currentSize - targetKB);
+            const bytes = await pdf.save();
+            const s = bytes.length / 1024;
+            bestBytes = bytes;
 
-            // Record best result
-            if (diff < bestDiff) {
-                bestDiff = diff;
-                bestBytes = pdfBytes;
-            }
-
-            // Stop if we hit 3% tolerance
-            if (diff < (targetKB * 0.03)) break;
-
-            if (currentSize > targetKB) {
-                maxQ = q - 1;
-                // If even at low quality size is big, reduce resolution
-                if (q < 10) {
-                    currentWidth *= 0.8;
-                    minQ = 10; maxQ = 90; // Reset search
-                }
-            } else {
-                minQ = q + 1;
-                // If even at max quality size is small, increase resolution
-                if (q > 95) {
-                    currentWidth *= 1.2;
-                    minQ = 10; maxQ = 90; // Reset search
-                }
+            if (Math.abs(s - targetKB) < targetKB * 0.05) break;
+            if (s > targetKB) { 
+                maxQ = q - 1; 
+                if (q < 15) currentWidth *= 0.8; 
+            } else { 
+                minQ = q + 1; 
+                if (q > 90) currentWidth *= 1.2;
             }
         }
-
-        const finalPath = path.join("outputs", `final_${sessionID}.pdf`);
+        const finalPath = `outputs/extreme_${sessionID}.pdf`;
         fs.writeFileSync(finalPath, bestBytes);
         return finalPath;
-
     } finally {
-        // Cleanup all temporary images for this session
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
 }
@@ -99,21 +80,28 @@ async function smartCompress(inputPath, targetKB) {
 app.post("/compress", upload.single("file"), async (req, res) => {
     try {
         const target = parseInt(req.body.target);
-        if (!target || !req.file) return res.status(400).send("Target KB and File required");
+        const input = req.file.path;
 
-        console.log(`Starting compression for target: ${target}KB`);
-        const result = await smartCompress(req.file.path, target);
-        
-        res.download(result, (err) => {
-            // Cleanup after download
-            if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-            if (fs.existsSync(result)) fs.unlinkSync(result);
-        });
+        // 1. Try Ghostscript Profiles in sequence
+        const profiles = ['printer', 'ebook', 'screen'];
+        let lastGsResult = null;
+
+        for (const p of profiles) {
+            const resGS = tryGhost(input, target, p);
+            if (resGS.success) {
+                return res.download(resGS.path); // Mil gaya target ke paas!
+            }
+            lastGsResult = resGS;
+        }
+
+        // 2. Agar GS fail ho gaya (ya size abhi bhi bada hai), use Extreme mode
+        // Note: Agar GS ka 'screen' profile bhi target hit nahi kar paya, tabhi niche jayega
+        const finalResult = await extremeCompress(input, target);
+        res.download(finalResult);
+
     } catch (e) {
-        console.error("Critical Error:", e);
-        res.status(500).send("Logic Error: " + e.message);
+        res.status(500).send("Error: " + e.message);
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Smart Engine active on port ${PORT}`));
+app.listen(3000, () => console.log("Engine running..."));

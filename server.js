@@ -1,63 +1,87 @@
 import express from "express";
 import multer from "multer";
-import { exec } from "child_process";
+import { execSync } from "child_process";
 import fs from "fs";
+import sharp from "sharp";
+import { PDFDocument } from "pdf-lib";
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-function getFileSizeKB(path) {
-  const stats = fs.statSync(path);
-  return stats.size / 1024;
+function sizeKB(path){
+ return fs.statSync(path).size / 1024;
 }
 
-const presets = [
-  "/printer",
-  "/ebook",
-  "/screen"
-];
+// -------- GHOSTSCRIPT NORMAL MODE --------
+function ghostCompress(input, output){
+ execSync(`gs -sDEVICE=pdfwrite \
+ -dCompatibilityLevel=1.4 \
+ -dPDFSETTINGS=/screen \
+ -dNOPAUSE -dQUIET -dBATCH \
+ -sOutputFile=${output} ${input}`);
+}
 
-app.post("/compress", upload.single("file"), async (req, res) => {
+// -------- EXTREME MODE --------
+async function extremeCompress(input, output){
 
-  const inputPath = req.file.path;
-  const targetKB = parseInt(req.body.target);
+ // PDF → images
+ execSync(`pdftoppm -jpeg ${input} temp_images/page`);
 
-  if (!targetKB) {
-    return res.status(400).send("target (KB) required");
-  }
+ const files = fs.readdirSync("temp_images");
 
-  let bestOutput = null;
+ const pdf = await PDFDocument.create();
 
-  for (let preset of presets) {
+ for(const f of files){
 
-    const outputPath = `outputs/compressed-${Date.now()}.pdf`;
+   const imgPath = `temp_images/${f}`;
 
-    const command = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=${preset} -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${outputPath} ${inputPath}`;
+   const compressed = await sharp(imgPath)
+      .jpeg({ quality:40 })
+      .toBuffer();
 
-    await new Promise((resolve) => {
-      exec(command, () => resolve());
-    });
+   const img = await pdf.embedJpg(compressed);
 
-    const sizeKB = getFileSizeKB(outputPath);
+   const page = pdf.addPage([img.width,img.height]);
 
-    bestOutput = outputPath;
+   page.drawImage(img,{
+     x:0,
+     y:0,
+     width:img.width,
+     height:img.height
+   });
 
-    if (sizeKB <= targetKB) {
-      break;
-    }
-  }
+ }
 
-  res.download(bestOutput, () => {
-    fs.unlinkSync(inputPath);
-    fs.unlinkSync(bestOutput);
-  });
+ const pdfBytes = await pdf.save();
+ fs.writeFileSync(output,pdfBytes);
+}
+
+// -------- MAIN API --------
+app.post("/compress", upload.single("file"), async (req,res)=>{
+
+ const input = req.file.path;
+ const output = `outputs/out-${Date.now()}.pdf`;
+
+ const target = parseInt(req.body.target);
+
+ const original = sizeKB(input);
+
+ const ratio = original / target;
+
+ if(ratio > 5){
+
+   await extremeCompress(input,output);
+
+ }else{
+
+   ghostCompress(input,output);
+
+ }
+
+ res.download(output);
 
 });
 
-app.get("/", (req,res)=>{
-  res.send("PDF Compress API Running");
-});
-
-app.listen(3000, ()=>{
-  console.log("Server running");
+app.listen(3000,()=>{
+ console.log("Smart PDF Compressor running");
 });

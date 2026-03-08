@@ -9,11 +9,11 @@ const app = express();
 const upload = multer({ dest: "uploads/" });
 
 function sizeKB(path){
-  return fs.statSync(path).size / 1024;
+ return fs.statSync(path).size / 1024;
 }
 
-// ---------- Ghostscript Normal Compression ----------
-function ghostCompress(input, output){
+// ---------- Ghostscript ----------
+function ghostCompress(input,output){
 
  execSync(`gs -sDEVICE=pdfwrite \
  -dCompatibilityLevel=1.4 \
@@ -23,109 +23,95 @@ function ghostCompress(input, output){
 
 }
 
-// ---------- Extreme Compression ----------
-async function extremeCompress(input, output, ratio){
+// ---------- Extreme Adaptive ----------
+async function extremeCompress(input,target){
+
+ const qualities = [60,50,40,35,30,25,20,15];
 
  if(!fs.existsSync("temp_images")) fs.mkdirSync("temp_images");
 
- fs.readdirSync("temp_images").forEach(f=>{
-  fs.unlinkSync(`temp_images/${f}`);
- });
-
- // Dynamic DPI
- let dpi = 72;
-
- if(ratio > 8) dpi = 40;
- else if(ratio > 5) dpi = 50;
- else if(ratio > 3) dpi = 60;
-
- execSync(`pdftoppm -jpeg -r ${dpi} ${input} temp_images/page`);
+ execSync(`pdftoppm -jpeg -r 72 ${input} temp_images/page`);
 
  const files = fs.readdirSync("temp_images")
-  .filter(f => f.endsWith(".jpg"))
+  .filter(f=>f.endsWith(".jpg"))
   .sort();
 
- const pdf = await PDFDocument.create();
+ let bestOutput = null;
+ let bestDiff = Infinity;
 
- for(const f of files){
+ for(const q of qualities){
 
-  const imgPath = `temp_images/${f}`;
+  const pdf = await PDFDocument.create();
 
-  // Dynamic image resize
-  let width = 900;
-  let quality = 30;
+  for(const f of files){
 
-  if(ratio > 8){
-    width = 500;
-    quality = 15;
+   const imgPath = `temp_images/${f}`;
+
+   const compressed = await sharp(imgPath)
+     .resize({width:800})
+     .jpeg({quality:q})
+     .toBuffer();
+
+   const img = await pdf.embedJpg(compressed);
+
+   const page = pdf.addPage([img.width,img.height]);
+
+   page.drawImage(img,{
+     x:0,
+     y:0,
+     width:img.width,
+     height:img.height
+   });
+
   }
-  else if(ratio > 5){
-    width = 700;
-    quality = 20;
+
+  const pdfBytes = await pdf.save();
+
+  const out = `outputs/out-${Date.now()}-${q}.pdf`;
+
+  fs.writeFileSync(out,pdfBytes);
+
+  const size = sizeKB(out);
+
+  const diff = Math.abs(size-target);
+
+  if(diff < bestDiff){
+    bestDiff = diff;
+    bestOutput = out;
   }
-  else if(ratio > 3){
-    width = 800;
-    quality = 25;
+
+  if(size <= target){
+    return out;
   }
-
-  const compressed = await sharp(imgPath)
-   .resize({ width })
-   .jpeg({ quality })
-   .toBuffer();
-
-  const img = await pdf.embedJpg(compressed);
-
-  const page = pdf.addPage([img.width, img.height]);
-
-  page.drawImage(img,{
-    x:0,
-    y:0,
-    width:img.width,
-    height:img.height
-  });
 
  }
 
- const pdfBytes = await pdf.save();
-
- fs.writeFileSync(output,pdfBytes);
+ return bestOutput;
 
 }
 
-// ---------- Main API ----------
-app.post("/compress", upload.single("file"), async (req,res)=>{
+// ---------- API ----------
+app.post("/compress",upload.single("file"),async(req,res)=>{
 
  try{
 
   const input = req.file.path;
-  const output = `outputs/out-${Date.now()}.pdf`;
-
   const target = parseInt(req.body.target);
-
-  if(!target) return res.status(400).send("Target size required");
 
   const original = sizeKB(input);
 
-  const ratio = original / target;
+  let output;
 
-  console.log("Original:",original,"Target:",target,"Ratio:",ratio);
+  if(original/target > 2){
 
-  if(ratio > 2){
-
-   console.log("Extreme compression");
-
-   await extremeCompress(input,output,ratio);
+   output = await extremeCompress(input,target);
 
   }else{
 
-   console.log("Ghostscript compression");
+   output = `outputs/out-${Date.now()}.pdf`;
 
    ghostCompress(input,output);
 
-  }
-
-  if(!fs.existsSync(output)){
-   return res.status(500).send("Compression failed");
   }
 
   res.download(output);
@@ -140,9 +126,8 @@ app.post("/compress", upload.single("file"), async (req,res)=>{
 
 });
 
-// ---------- Status ----------
 app.get("/",(req,res)=>{
- res.send("Smart PDF Compressor running");
+ res.send("Smart compressor running");
 });
 
 app.listen(3000,()=>{

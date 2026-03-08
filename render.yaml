@@ -4,7 +4,6 @@ services:
     env: node
     buildCommand: |
       apt-get update
-      apt-get install -y ghostscript
-      poppler-utils
+      apt-get install -y ghostscript poppler-utils
       npm install
     startCommand: node server.js

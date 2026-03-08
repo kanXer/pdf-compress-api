@@ -8,80 +8,129 @@ import { PDFDocument } from "pdf-lib";
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-function sizeKB(path){
- return fs.statSync(path).size / 1024;
+function sizeKB(path) {
+  return fs.statSync(path).size / 1024;
 }
 
-// -------- GHOSTSCRIPT NORMAL MODE --------
-function ghostCompress(input, output){
- execSync(`gs -sDEVICE=pdfwrite \
- -dCompatibilityLevel=1.4 \
- -dPDFSETTINGS=/screen \
- -dNOPAUSE -dQUIET -dBATCH \
- -sOutputFile=${output} ${input}`);
+// ---------- Ghostscript Compression ----------
+function ghostCompress(input, output) {
+
+  execSync(`gs -sDEVICE=pdfwrite \
+-dCompatibilityLevel=1.4 \
+-dPDFSETTINGS=/screen \
+-dNOPAUSE -dQUIET -dBATCH \
+-sOutputFile=${output} ${input}`);
+
 }
 
-// -------- EXTREME MODE --------
-async function extremeCompress(input, output){
+// ---------- Extreme Compression ----------
+async function extremeCompress(input, output) {
 
- // PDF → images
- execSync(`pdftoppm -jpeg ${input} temp_images/page`);
+  // clean temp_images
+  if (!fs.existsSync("temp_images")) fs.mkdirSync("temp_images");
 
- const files = fs.readdirSync("temp_images");
+  fs.readdirSync("temp_images").forEach(f => {
+    fs.unlinkSync(`temp_images/${f}`);
+  });
 
- const pdf = await PDFDocument.create();
+  // PDF → JPEG images
+  execSync(`pdftoppm -jpeg ${input} temp_images/page`);
 
- for(const f of files){
+  const files = fs.readdirSync("temp_images")
+    .filter(f => f.endsWith(".jpg"))
+    .sort();
 
-   const imgPath = `temp_images/${f}`;
+  if (files.length === 0) {
+    throw new Error("Image conversion failed");
+  }
 
-   const compressed = await sharp(imgPath)
-      .jpeg({ quality:40 })
+  const pdf = await PDFDocument.create();
+
+  for (const f of files) {
+
+    const imgPath = `temp_images/${f}`;
+
+    const compressed = await sharp(imgPath)
+      .jpeg({ quality: 40 })
       .toBuffer();
 
-   const img = await pdf.embedJpg(compressed);
+    const img = await pdf.embedJpg(compressed);
 
-   const page = pdf.addPage([img.width,img.height]);
+    const page = pdf.addPage([img.width, img.height]);
 
-   page.drawImage(img,{
-     x:0,
-     y:0,
-     width:img.width,
-     height:img.height
-   });
+    page.drawImage(img, {
+      x: 0,
+      y: 0,
+      width: img.width,
+      height: img.height
+    });
 
- }
+  }
 
- const pdfBytes = await pdf.save();
- fs.writeFileSync(output,pdfBytes);
+  const pdfBytes = await pdf.save();
+
+  fs.writeFileSync(output, pdfBytes);
 }
 
-// -------- MAIN API --------
-app.post("/compress", upload.single("file"), async (req,res)=>{
+// ---------- Main API ----------
+app.post("/compress", upload.single("file"), async (req, res) => {
 
- const input = req.file.path;
- const output = `outputs/out-${Date.now()}.pdf`;
+  try {
 
- const target = parseInt(req.body.target);
+    const input = req.file.path;
+    const output = `outputs/out-${Date.now()}.pdf`;
 
- const original = sizeKB(input);
+    const target = parseInt(req.body.target);
 
- const ratio = original / target;
+    if (!target) {
+      return res.status(400).send("Target size required");
+    }
 
- if(ratio > 5){
+    const original = sizeKB(input);
 
-   await extremeCompress(input,output);
+    const ratio = original / target;
 
- }else{
+    console.log("Original:", original, "Target:", target, "Ratio:", ratio);
 
-   ghostCompress(input,output);
+    if (ratio > 5) {
 
- }
+      console.log("Using EXTREME compression");
 
- res.download(output);
+      await extremeCompress(input, output);
+
+    } else {
+
+      console.log("Using NORMAL compression");
+
+      ghostCompress(input, output);
+
+    }
+
+    if (!fs.existsSync(output)) {
+      return res.status(500).send("Compression failed");
+    }
+
+    res.download(output);
+
+  } catch (err) {
+
+    console.error(err);
+
+    res.status(500).send("Compression error");
+
+  }
 
 });
 
-app.listen(3000,()=>{
- console.log("Smart PDF Compressor running");
+// ---------- Status Route ----------
+app.get("/", (req, res) => {
+
+  res.send("Smart PDF Compressor running");
+
+});
+
+app.listen(3000, () => {
+
+  console.log("Server running on port 3000");
+
 });

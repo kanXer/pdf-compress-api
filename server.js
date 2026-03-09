@@ -6,8 +6,14 @@ import { execSync } from "child_process";
 import { PDFDocument } from "pdf-lib";
 import path from "path";
 import crypto from "crypto";
+const cors = require('cors');
 
 const app = express();
+app.use(cors({
+  origin: '*', // Sabhi domains ko allow karne ke liye (Development ke liye theek hai)
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 const upload = multer({ dest: "uploads/" });
 
 ["uploads", "outputs", "temp_images"].forEach(d => !fs.existsSync(d) && fs.mkdirSync(d));

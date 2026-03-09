@@ -14,121 +14,106 @@ const app = express();
 app.use(cors());
 const upload = multer({ dest: "uploads/" });
 
-// Zaroori folders banayein
 ["uploads", "outputs", "temp_images"].forEach(d => !fs.existsSync(d) && fs.mkdirSync(d));
 
 /**
- * Ek single image par binary search karke sahi Quality (Q) dhoondna
+ * STRATEGY 1: Ghostscript (Efficient & preserves text)
  */
-async function getOptimalQuality(sampleImagePath, targetPerPage) {
-    let low = 5, high = 95, bestQ = 60;
-    for (let i = 0; i < 6; i++) { 
-        let q = Math.floor((low + high) / 2);
-        const buffer = await sharp(sampleImagePath)
-            .jpeg({ quality: q, mozjpeg: true })
-            .withMetadata(false)
-            .toBuffer();
-        const size = buffer.length / 1024;
-        
-        if (size > targetPerPage) {
-            high = q - 1;
-        } else {
-            low = q + 1;
-            bestQ = q;
-        }
+async function tryGhostscript(input, targetKB) {
+    const out = `outputs/gs_${Date.now()}.pdf`;
+    // 'screen' profile sabse aggressive compression karta hai (72 DPI)
+    const cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${out}" "${input}"`;
+    try {
+        await execPromise(cmd);
+        const size = fs.statSync(out).size / 1024;
+        return { path: out, size, success: size <= targetKB * 1.1 };
+    } catch (e) {
+        return { success: false };
     }
-    return bestQ;
 }
 
 /**
- * Main Compression Engine
+ * STRATEGY 2: Adaptive Rasterization (When GS fails)
  */
-async function fastExtremeCompress(inputPath, targetKB) {
+async function extremeRasterCompress(inputPath, targetKB) {
     const sessionID = crypto.randomUUID();
     const sessionDir = path.join("temp_images", sessionID);
     fs.mkdirSync(sessionDir);
 
     try {
-        // 1. PDF to JPEG (150 DPI balanced hai speed aur quality ke liye)
-        await execPromise(`pdftoppm -jpeg -r 150 "${inputPath}" "${sessionDir}/page"`);
+        // Target ke hisaab se DPI set karo (50KB ke liye 72 DPI kaafi hai)
+        const dpi = targetKB < 100 ? 72 : 120;
+        await execPromise(`pdftoppm -jpeg -r ${dpi} "${inputPath}" "${sessionDir}/page"`);
+        
         const files = fs.readdirSync(sessionDir)
             .filter(f => f.endsWith(".jpg"))
             .sort((a,b) => a.localeCompare(b, undefined, {numeric: true}));
         
         const totalPages = files.length;
+        const overhead = (totalPages * 1.2) + 10;
+        const targetPerPage = (targetKB - overhead) / totalPages;
 
-        // 2. Overhead Calculation: Metadata aur Page structure ka wazan minus karo
-        // Har page approx 1.2KB se 2KB overhead leta hai
-        const estimatedOverhead = (totalPages * 1.5) + 10; 
-        const targetForImages = targetKB - estimatedOverhead;
-        const targetPerPage = targetForImages / totalPages;
+        // Black & White if target is very low
+        const useGrayscale = targetKB < 100;
 
-        // 3. Pehle page par test karke "Best Quality" nikalo
-        let currentQuality = await getOptimalQuality(path.join(sessionDir, files[0]), targetPerPage);
-
-        let finalBytes;
-        let finalSize;
-        let attempts = 0;
-
-        // 4. Construction & Auto-Correction Loop
-        while (attempts < 2) {
-            const pdf = await PDFDocument.create();
+        const pdf = await PDFDocument.create();
+        const pageBuffers = await Promise.all(files.map(async (f) => {
+            let s = sharp(path.join(sessionDir, f)).rotate().withMetadata(false);
+            if (useGrayscale) s = s.grayscale();
             
-            // Parallel processing for speed
-            const pageBuffers = await Promise.all(files.map(f => 
-                sharp(path.join(sessionDir, f))
-                    .rotate()
-                    .jpeg({ quality: currentQuality, mozjpeg: true })
-                    .withMetadata(false)
-                    .toBuffer()
-            ));
+            // Start with very low quality if target is tight
+            return s.jpeg({ quality: 30, mozjpeg: true }).toBuffer();
+        }));
 
-            for (const b of pageBuffers) {
-                const img = await pdf.embedJpg(b);
-                const page = pdf.addPage([img.width, img.height]);
-                page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
-            }
-
-            finalBytes = await pdf.save();
-            finalSize = finalBytes.length / 1024;
-
-            // Agar size target se chhota hai toh exit, warna quality kam karke dubara
-            if (finalSize <= targetKB) break;
-            
-            currentQuality -= 7; // Quality drop if overshoot
-            attempts++;
+        for (const b of pageBuffers) {
+            const img = await pdf.embedJpg(b);
+            pdf.addPage([img.width, img.height]).drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
         }
 
-        const finalPath = `outputs/compressed_${sessionID}.pdf`;
+        const finalBytes = await pdf.save();
+        const finalPath = `outputs/ext_${sessionID}.pdf`;
         fs.writeFileSync(finalPath, finalBytes);
-        return { path: finalPath, size: finalSize };
-
+        return { path: finalPath, size: finalBytes.length / 1024 };
     } finally {
-        // Cleanup: Temporary images delete karein
-        if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+        fs.rmSync(sessionDir, { recursive: true, force: true });
     }
 }
 
-// API Endpoint
 app.post("/compress-pdf", upload.single("file"), async (req, res) => {
     try {
-        if (!req.file || !req.body.target) {
-            return res.status(400).send("File aur Target size (KB) dono chahiye.");
+        const input = req.file.path;
+        const target = parseInt(req.body.target);
+        const originalSize = fs.statSync(input).size / 1024;
+
+        console.log(`Processing: ${originalSize}KB -> Target: ${target}KB`);
+
+        // Step 1: Try Ghostscript (Best for Text)
+        let result = await tryGhostscript(input, target);
+
+        // Step 2: If GS not enough, try Extreme Rasterization
+        if (!result.success || result.size > target) {
+            console.log("Ghostscript insufficient, trying Extreme Rasterization...");
+            const rasterResult = await extremeRasterCompress(input, target);
+            
+            // Pick whichever is smaller
+            if (result.path && fs.existsSync(result.path) && result.size < rasterResult.size) {
+                // Keep GS result
+            } else {
+                result = rasterResult;
+            }
         }
 
-        const target = parseInt(req.body.target);
-        const result = await fastExtremeCompress(req.file.path, target);
-        
-        res.download(result.path, (err) => {
-            // Download ke baad input aur output cleanup
-            if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-            // Result file delete karne se pehle delay ya cron job behtar hai
-        });
+        // Final Safety: Agar abhi bhi bada hai original se, toh error ya original bhej do
+        if (result.size > originalSize) {
+            console.log("Warning: Compression increased size. Sending original.");
+            return res.download(input);
+        }
+
+        res.download(result.path);
 
     } catch (e) {
-        console.error(e);
-        res.status(500).send("Server Error: " + e.message);
+        res.status(500).send("Error: " + e.message);
     }
 });
 
-app.listen(3000, () => console.log("PDF Engine is running on port 3000..."));
+app.listen(3000, () => console.log("Precision Engine running on 3000..."));

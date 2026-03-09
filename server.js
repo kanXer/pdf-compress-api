@@ -77,7 +77,7 @@ async function extremeCompress(inputPath, targetKB) {
     }
 }
 
-app.post("/compress", upload.single("file"), async (req, res) => {
+app.post("/compress-pdf", upload.single("file"), async (req, res) => {
     try {
         const target = parseInt(req.body.target);
         const input = req.file.path;

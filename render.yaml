@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pdf-compress-api
+    name: pdf-apis
     env: node
     buildCommand: |
       apt-get update
